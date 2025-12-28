@@ -1,0 +1,36 @@
+{
+  "name": "photoanalyzer-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Warhammer 40K Miniature Analyzer",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "form-data": "^4.0.4",
+    "multer": "^1.4.5-lts.1",
+    "onnxruntime-node": "^1.23.2",
+    "p-limit": "^7.2.0",
+    "sharp": "^0.34.4",
+    "uuid": "^13.0.0",
+    "winston": "^3.18.3",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.16",
+    "@types/express": "^4.17.21",
+    "@types/form-data": "^2.5.2",
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.9.0",
+    "tsx": "^4.1.1",
+    "typescript": "^5.2.2",
+    "vitest": "^0.34.6"
+  }
+}
