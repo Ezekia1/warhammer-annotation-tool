@@ -371,6 +371,71 @@ app.post('/api/annotate/export', async (req: Request, res: Response, next: NextF
 })
 
 // ═══════════════════════════════════════════════════════════
+// YOLO INFERENCE ENDPOINT
+// ═══════════════════════════════════════════════════════════
+
+import { predictBoxes, isModelAvailable } from './services/yoloInferenceService'
+
+/**
+ * GET /api/annotate/predict/:imageId
+ *
+ * Get AI predictions for an image using the trained YOLO model
+ */
+app.get('/api/annotate/predict/:imageId', async (req: Request, res: Response, next: NextFunction) => {
+  const requestId = (req as any).id
+  const log = createRequestLogger(requestId)
+
+  try {
+    const { imageId } = req.params
+    log.info(`🤖 Predicting boxes for: ${imageId}`)
+
+    // Check if model is available
+    const modelReady = await isModelAvailable()
+    if (!modelReady) {
+      log.error(`🔴 YOLO model not found`)
+      return res.status(503).json({
+        success: false,
+        error: {
+          code: 'MODEL_NOT_AVAILABLE',
+          message: 'YOLO model not found. Please ensure best.pt is in runs/ directory.'
+        },
+        requestId
+      })
+    }
+
+    // Get image path
+    const images = await annotationService.getImageList(true)
+    const image = images.find(img => img.imageId === imageId)
+
+    if (!image) {
+      log.error(`🔴 Image not found: ${imageId}`)
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Image not found'
+        },
+        requestId
+      })
+    }
+
+    // Run inference
+    const result = await predictBoxes(image.imagePath, imageId)
+
+    log.info(`✅ Predicted ${result.predictions.length} boxes in ${result.inferenceTime}ms`)
+
+    res.json({
+      success: true,
+      data: result,
+      requestId
+    })
+  } catch (error: any) {
+    log.error(`🔴 Prediction failed: ${error.message}`)
+    next(error)
+  }
+})
+
+// ═══════════════════════════════════════════════════════════
 // ERROR HANDLING
 // ═══════════════════════════════════════════════════════════
 

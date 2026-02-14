@@ -16,7 +16,7 @@ import logger from '../utils/logger'
 
 export interface QualityIssue {
   type: 'error' | 'warning'
-  code: 'BASE_OUTSIDE_MODEL' | 'BBOX_OUT_OF_BOUNDS' | 'BBOX_TOO_SMALL' | 'DUPLICATE_BOX'
+  code: 'BBOX_OUT_OF_BOUNDS' | 'BBOX_TOO_SMALL' | 'DUPLICATE_BOX'
   message: string
   bboxId?: string
 }
@@ -29,6 +29,9 @@ export interface ImageAnnotation {
   width: number
   height: number
   annotations: BboxAnnotationData[]
+  // AI prediction validation data (for training improvements)
+  rejectedPredictions?: RejectedPrediction[]  // False positives for hard negative mining
+  redrawnPredictions?: RejectedPrediction[]   // Wrong boxes that were corrected
   annotatedAt: string
   annotatedBy: string
 }
@@ -48,6 +51,21 @@ export interface BboxAnnotationData {
     height: number
   }
   classLabel: string  // Unit name (e.g., "hormagaunt")
+  confidence?: number
+  // AI prediction tracking
+  validationAction?: 'accepted' | 'rejected' | 'redrawn'
+  originalPrediction?: boolean  // Was this from AI?
+}
+
+export interface RejectedPrediction {
+  id: string
+  modelBbox: {
+    x: number
+    y: number
+    width: number
+    height: number
+  }
+  classLabel: string
   confidence?: number
 }
 
@@ -81,9 +99,13 @@ export class AnnotationService {
     }
   }
 
+  // Limit per faction for training - increased to 110 (original 60 + 50 more)
+  private perFactionLimit: number = 110
+
   /**
    * Get list of all images available for annotation
    * Returns image metadata including path, faction, source
+   * Limited to perFactionLimit (110) images per faction for focused annotation
    */
   async getImageList(includeAnnotated: boolean = false): Promise<Array<{
     imageId: string
@@ -100,6 +122,9 @@ export class AnnotationService {
       isAnnotated: boolean
     }> = []
 
+    // Track count per faction
+    const factionCounts: Record<string, number> = {}
+
     try {
       const factions = await fs.readdir(this.trainingDataPath)
 
@@ -109,6 +134,9 @@ export class AnnotationService {
 
         if (!stat.isDirectory()) continue
         if (faction === 'hormagaunts' || faction === 'tyranid_ripper_swarm') continue
+        if (faction === 'reddit' || faction === 'dakkadakka') continue  // Skip non-faction dirs
+
+        factionCounts[faction] = 0
 
         // Check reddit and dakkadakka subdirectories
         for (const source of ['reddit', 'dakkadakka'] as const) {
@@ -118,12 +146,19 @@ export class AnnotationService {
             const files = await fs.readdir(sourcePath)
 
             for (const file of files) {
+              // Stop if we've hit the limit for this faction
+              if (factionCounts[faction] >= this.perFactionLimit) break
+
               if (!file.match(/\.(jpg|jpeg|png|gif|webp)$/i)) continue
 
               const imagePath = path.join(sourcePath, file)
               const imageId = this.getImageId(imagePath)
               const isAnnotated = await this.isImageAnnotated(imageId)
 
+              // Count ALL images toward limit (not just filtered ones)
+              factionCounts[faction]++
+
+              // But only add to results if it matches the filter
               if (includeAnnotated || !isAnnotated) {
                 images.push({
                   imageId,
@@ -141,7 +176,7 @@ export class AnnotationService {
         }
       }
 
-      logger.info(`📋 Found ${images.length} images (includeAnnotated: ${includeAnnotated})`)
+      logger.info(`📋 Found ${images.length} images (${this.perFactionLimit}/faction, includeAnnotated: ${includeAnnotated})`)
       return images
     } catch (error) {
       logger.error('Error getting image list:', error)
@@ -199,46 +234,13 @@ export class AnnotationService {
           issues.push({
             type: 'warning',
             code: 'BBOX_TOO_SMALL',
-            message: `Model bbox very small (${model.width}x${model.height}px)`,
+            message: `Bbox very small (${model.width}x${model.height}px)`,
             bboxId: bbox.id,
           })
         }
-
-        // 3. If base bbox exists, check it's inside model bbox
-        if (bbox.baseBbox) {
-          const base = bbox.baseBbox
-          const modelBounds = {
-            x1: model.x,
-            y1: model.y,
-            x2: model.x + model.width,
-            y2: model.y + model.height,
-          }
-
-          const baseBounds = {
-            x1: base.x,
-            y1: base.y,
-            x2: base.x + base.width,
-            y2: base.y + base.height,
-          }
-
-          // Check all corners of base are inside model
-          if (
-            baseBounds.x1 < modelBounds.x1 ||
-            baseBounds.y1 < modelBounds.y1 ||
-            baseBounds.x2 > modelBounds.x2 ||
-            baseBounds.y2 > modelBounds.y2
-          ) {
-            issues.push({
-              type: 'error',
-              code: 'BASE_OUTSIDE_MODEL',
-              message: 'Base bbox extends outside model bbox',
-              bboxId: bbox.id,
-            })
-          }
-        }
       }
 
-      // 4. Check for duplicate/overlapping boxes
+      // 3. Check for duplicate/overlapping boxes
       for (let i = 0; i < annotation.annotations.length; i++) {
         for (let j = i + 1; j < annotation.annotations.length; j++) {
           const iou = this.calculateIoU(
@@ -400,7 +402,10 @@ export class AnnotationService {
         'utf-8'
       )
 
-      logger.info(`✅ Saved annotation for ${annotation.imageId} (${annotation.annotations.length} detections)`)
+      const rejectedCount = annotation.rejectedPredictions?.length || 0
+      const redrawnCount = annotation.redrawnPredictions?.length || 0
+      const aiAccepted = annotation.annotations.filter(a => a.originalPrediction).length
+      logger.info(`✅ Saved annotation for ${annotation.imageId} (${annotation.annotations.length} boxes, ${aiAccepted} AI-accepted, ${rejectedCount} rejected, ${redrawnCount} redrawn)`)
     } catch (error) {
       logger.error('Error saving annotation:', error)
       throw error
@@ -437,6 +442,7 @@ export class AnnotationService {
 
   /**
    * Get annotation progress statistics
+   * Shows progress toward the per-faction limit (110 per faction)
    */
   async getProgress(): Promise<AnnotationProgress> {
     const allImages = await this.getImageList(true)
@@ -454,10 +460,14 @@ export class AnnotationService {
       }
     }
 
+    // Calculate total target (110 per faction × number of factions)
+    const numFactions = Object.keys(byFaction).length
+    const totalTarget = numFactions * this.perFactionLimit
+
     return {
-      totalImages: allImages.length,
+      totalImages: totalTarget,  // Show target, not raw count
       annotatedImages: annotatedImages.length,
-      percentComplete: (annotatedImages.length / allImages.length) * 100,
+      percentComplete: (annotatedImages.length / totalTarget) * 100,
       byFaction
     }
   }
@@ -514,11 +524,14 @@ export class AnnotationService {
 
     for (const img of annotatedImages) {
       const annotation = await this.getAnnotation(img.imageId)
+      // Only include images with actual annotations (skip empty/skipped ones)
       if (annotation && annotation.annotations.length > 0) {
         annotations.push({ image: img, annotation })
         annotation.annotations.forEach(ann => classesSet.add(ann.classLabel))
       }
     }
+
+    logger.info(`📊 Exporting ${annotations.length} images with annotations (excluded ${annotatedImages.length - annotations.length} skipped/empty)`)
 
     // Create class mapping
     const classes = Array.from(classesSet).sort()
@@ -561,7 +574,7 @@ export class AnnotationService {
     await fs.writeFile(classesFile, classes.join('\n'), 'utf-8')
 
     // Write YOLO data.yaml
-    const yamlContent = `# YOLO Pose Dataset Configuration
+    const yamlContent = `# YOLO Dataset Configuration
 path: ${outputPath}
 train: images/train
 val: images/val
@@ -569,11 +582,6 @@ val: images/val
 # Classes
 nc: ${classes.length}
 names: [${classes.map(c => `"${c}"`).join(', ')}]
-
-# Keypoints (base corners)
-# Each keypoint has 3 values: x, y, visibility (0=not visible, 1=visible)
-# Keypoint order: TL, TR, BR, BL (clockwise from top-left)
-kpt_shape: [4, 3]  # 4 keypoints (base corners), 3 values each (x, y, visibility)
 `
     await fs.writeFile(path.join(outputPath, 'data.yaml'), yamlContent, 'utf-8')
 
@@ -615,50 +623,22 @@ kpt_shape: [4, 3]  # 4 keypoints (base corners), 3 values each (x, y, visibility
       const classIndex = classToIndex.get(ann.classLabel)
       if (classIndex === undefined) continue
 
-      // Normalize model bbox to [0, 1]
+      // Normalize bbox to [0, 1]
+      // YOLO format: class x_center y_center width height
       const x_center = (ann.modelBbox.x + ann.modelBbox.width / 2) / imageWidth
       const y_center = (ann.modelBbox.y + ann.modelBbox.height / 2) / imageHeight
       const width = ann.modelBbox.width / imageWidth
       const height = ann.modelBbox.height / imageHeight
 
-      // YOLO-Pose format with keypoints
-      // If base bbox missing → standard bbox only (5 values)
-      // If base bbox present → bbox + keypoints (17 values: 5 bbox + 12 keypoint values)
-      if (ann.baseBbox) {
-        const bb = ann.baseBbox
-        // Base corners as keypoints: TL, TR, BR, BL (clockwise from top-left)
-        // Each keypoint: x, y, visibility (3 values)
-        const keypoints = [
-          bb.x / imageWidth, bb.y / imageHeight, 1,  // TL (x, y, visible)
-          (bb.x + bb.width) / imageWidth, bb.y / imageHeight, 1,  // TR
-          (bb.x + bb.width) / imageWidth, (bb.y + bb.height) / imageHeight, 1,  // BR
-          bb.x / imageWidth, (bb.y + bb.height) / imageHeight, 1  // BL
-        ]
+      const line = [
+        classIndex,
+        x_center.toFixed(6),
+        y_center.toFixed(6),
+        width.toFixed(6),
+        height.toFixed(6)
+      ].join(' ')
 
-        // YOLO-Pose format: class x_center y_center width height kp1_x kp1_y kp1_v kp2_x kp2_y kp2_v ...
-        const line = [
-          classIndex,
-          x_center.toFixed(6),
-          y_center.toFixed(6),
-          width.toFixed(6),
-          height.toFixed(6),
-          ...keypoints.map(k => k.toFixed(6))
-        ].join(' ')
-
-        yoloLines.push(line)
-      } else {
-        // No base bbox - standard bbox only (no keypoints)
-        // YOLO format: class x_center y_center width height
-        const line = [
-          classIndex,
-          x_center.toFixed(6),
-          y_center.toFixed(6),
-          width.toFixed(6),
-          height.toFixed(6)
-        ].join(' ')
-
-        yoloLines.push(line)
-      }
+      yoloLines.push(line)
     }
 
     // Write label file

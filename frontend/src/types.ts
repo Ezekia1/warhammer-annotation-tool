@@ -13,4 +13,11 @@ export interface BboxAnnotation {
     width: number
     height: number
   }
+  // AI prediction fields
+  confidence?: number  // AI confidence score (0-1)
+  isPrediction?: boolean  // True if this is an AI prediction
+  validated?: boolean  // True if user has validated this prediction
+  // Validation tracking for training data
+  validationAction?: 'accepted' | 'rejected' | 'redrawn'  // What action user took
+  originalPrediction?: boolean  // Was this originally an AI prediction?
 }
